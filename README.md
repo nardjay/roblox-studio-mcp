@@ -59,7 +59,7 @@ In Studio: **Plugins** tab → **RobloxMCP** → the panel opens and auto-connec
 
 ### 4. Verify end to end
 
-```powershell
+```powershell 
 node scripts/smoke-studio.mjs      # 17 checks against the open place, cleans up after itself
 node scripts/mcp-check.mjs         # speaks MCP stdio, lists tools, calls a few
 ```
