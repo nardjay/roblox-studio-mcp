@@ -13,7 +13,7 @@
   "scripts": {
     "start": "node ./bin/roblox-mcp.js",
     "build:plugin": "node ./plugin/build.js",
-    "test": "node --test test/",
+    "test": "node --test",
     "test:syntax": "node ./test/luau-syntax.test.js",
     "smoke": "node ./scripts/smoke-studio.mjs",
     "mcp-check": "node ./scripts/mcp-check.mjs",
