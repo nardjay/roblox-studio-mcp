@@ -10,6 +10,14 @@ if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
+# Pick up anything you changed directly on github.com, so the push is never
+# rejected as "remote contains work that you do not have locally".
+git pull --rebase --autostash origin main
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Could not sync with GitHub (conflict?). Fix the conflict, then run: git rebase --continue" -ForegroundColor Red
+    exit $LASTEXITCODE
+}
+
 git add -A
 
 $pending = git status --porcelain
