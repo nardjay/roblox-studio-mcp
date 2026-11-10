@@ -216,6 +216,12 @@ npm run smoke             # live Studio smoke test
 node bin/roblox-mcp.js --http-only --keep-alive   # bridge only, drive it with curl /v1/rpc
 ```
 
+### Saving changes
+
+Double-click **`save.cmd`** in the repo root, type a short message, press Enter: it pulls any
+website edits, commits everything, and pushes to GitHub. The plain-git equivalent is
+`git add -A && git commit -m "..." && git push`.
+
 `POST http://127.0.0.1:44755/v1/rpc` takes `{ "method": "getTree", "params": {...} }` and returns `{ "ok": true, "result": ... }` — handy for debugging without an MCP client.
 
 ## Limits
