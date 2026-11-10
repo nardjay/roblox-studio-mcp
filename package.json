@@ -1,0 +1,30 @@
+{
+  "name": "roblox-studio-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "MCP server + Roblox Studio plugin that lets AI agents inspect and edit a live Studio session.",
+  "type": "module",
+  "bin": {
+    "roblox-mcp": "./bin/roblox-mcp.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node ./bin/roblox-mcp.js",
+    "build:plugin": "node ./plugin/build.js",
+    "test": "node --test test/",
+    "test:syntax": "node ./test/luau-syntax.test.js",
+    "smoke": "node ./scripts/smoke-studio.mjs",
+    "mcp-check": "node ./scripts/mcp-check.mjs",
+    "install-plugin": "powershell -ExecutionPolicy Bypass -File ./scripts/install-plugin.ps1"
+  },
+  "files": [
+    "bin",
+    "src",
+    "plugin"
+  ],
+  "devDependencies": {
+    "@luau-rs/luau": "^0.739.0"
+  }
+}

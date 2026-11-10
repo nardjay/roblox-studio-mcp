@@ -1,0 +1,5 @@
+# Normalize line endings so the committed plugin model always matches
+# `npm run build:plugin` output, on any OS.
+* text=auto eol=lf
+*.png binary
+*.rbxmx text eol=lf

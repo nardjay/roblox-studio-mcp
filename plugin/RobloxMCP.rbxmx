@@ -1,0 +1,2231 @@
+<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">
+  <Item class="Script" referent="RBX0">
+    <Properties>
+      <string name="Name">RobloxMCP</string>
+      <ProtectedString name="Source">--!nonstrict
+-- RobloxMCP Studio plugin entry point.
+-- Shows a small control panel, long-polls the local MCP bridge and executes
+-- read/write operations against the open place.
+
+local ChangeHistoryService = game:GetService(&quot;ChangeHistoryService&quot;)
+local RunService = game:GetService(&quot;RunService&quot;)
+local Selection = game:GetService(&quot;Selection&quot;)
+
+local Api = require(script.Api)
+local Codec = require(script.Codec)
+local Ops = require(script.Ops)
+local Paths = require(script.Paths)
+
+local PROTOCOL = 1
+local POLL_TIMEOUT_SECONDS = 15
+
+local state = {
+	running = false,
+	connected = false,
+	served = 0,
+	port = 44755,
+	token = &quot;&quot;,
+	lastError = &quot;&quot;,
+}
+
+local currentApi = nil
+local pendingLogs = {}
+
+-- ------------------------------------------------------------------ settings
+
+local function loadSetting(key: string, default: any): any
+	local ok, value = pcall(function()
+		return plugin:GetSetting(key)
+	end)
+	if ok and value ~= nil then
+		return value
+	end
+	return default
+end
+
+local function saveSetting(key: string, value: any)
+	pcall(function()
+		plugin:SetSetting(key, value)
+	end)
+end
+
+-- ----------------------------------------------------------------------- ui
+
+local function create(className: string, properties: any, children: { Instance }?): any
+	local instance = Instance.new(className)
+	for key, value in pairs(properties or {}) do
+		instance[key] = value
+	end
+	for _, child in ipairs(children or {}) do
+		child.Parent = instance
+	end
+	return instance
+end
+
+local palette = {
+	background = Color3.fromRGB(38, 39, 44),
+	panel = Color3.fromRGB(48, 49, 56),
+	text = Color3.fromRGB(235, 236, 240),
+	muted = Color3.fromRGB(160, 163, 172),
+	accent = Color3.fromRGB(72, 132, 232),
+	ok = Color3.fromRGB(88, 196, 126),
+	bad = Color3.fromRGB(226, 106, 106),
+}
+
+local toolbar = plugin:CreateToolbar(&quot;RobloxMCP&quot;)
+local toolbarButton = toolbar:CreateButton(&quot;RobloxMCP&quot;, &quot;Connect Studio to the RobloxMCP server&quot;, &quot;&quot;)
+toolbarButton.ClickableWhenViewportHidden = true
+
+local widgetInfo = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 380, 460, 320, 320)
+local widget = plugin:CreateDockWidgetPluginGui(&quot;RobloxMCP&quot;, widgetInfo)
+widget.Title = &quot;RobloxMCP&quot;
+widget.Name = &quot;RobloxMCP&quot;
+
+local ui = {}
+
+local root = create(&quot;Frame&quot;, {
+	Name = &quot;Root&quot;,
+	Size = UDim2.fromScale(1, 1),
+	BackgroundColor3 = palette.background,
+	BorderSizePixel = 0,
+}, { create(&quot;UIPadding&quot;, { PaddingTop = UDim.new(0, 10), PaddingBottom = UDim.new(0, 10), PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }) })
+root.Parent = widget
+
+local top = create(&quot;Frame&quot;, {
+	Name = &quot;Top&quot;,
+	Size = UDim2.new(1, 0, 0, 236),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+}, {
+	create(&quot;UIListLayout&quot;, {
+		Padding = UDim.new(0, 6),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	}),
+})
+top.Parent = root
+
+local header = create(&quot;Frame&quot;, {
+	Name = &quot;Header&quot;,
+	Size = UDim2.new(1, 0, 0, 24),
+	BackgroundTransparency = 1,
+	LayoutOrder = 1,
+})
+header.Parent = top
+
+ui.dot = create(&quot;Frame&quot;, {
+	Name = &quot;Dot&quot;,
+	Size = UDim2.fromOffset(10, 10),
+	Position = UDim2.new(0, 0, 0.5, -5),
+	BackgroundColor3 = palette.bad,
+	BorderSizePixel = 0,
+}, { create(&quot;UICorner&quot;, { CornerRadius = UDim.new(1, 0) }) })
+ui.dot.Parent = header
+
+create(&quot;TextLabel&quot;, {
+	Name = &quot;Title&quot;,
+	Position = UDim2.new(0, 18, 0, 0),
+	Size = UDim2.new(1, -60, 1, 0),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBold,
+	Text = &quot;RobloxMCP&quot;,
+	TextColor3 = palette.text,
+	TextSize = 16,
+	TextXAlignment = Enum.TextXAlignment.Left,
+}).Parent = header
+
+ui.version = create(&quot;TextLabel&quot;, {
+	Name = &quot;Version&quot;,
+	Position = UDim2.new(1, -70, 0, 0),
+	Size = UDim2.new(0, 70, 1, 0),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.Gotham,
+	Text = &quot;v&quot; .. Ops.PLUGIN_VERSION,
+	TextColor3 = palette.muted,
+	TextSize = 11,
+	TextXAlignment = Enum.TextXAlignment.Right,
+})
+ui.version.Parent = header
+
+ui.status = create(&quot;TextLabel&quot;, {
+	Name = &quot;Status&quot;,
+	LayoutOrder = 2,
+	Size = UDim2.new(1, 0, 0, 0),
+	AutomaticSize = Enum.AutomaticSize.Y,
+	BackgroundTransparency = 1,
+	Font = Enum.Font.Gotham,
+	Text = &quot;Idle. Press Connect to attach to the MCP server.&quot;,
+	TextColor3 = palette.muted,
+	TextSize = 12,
+	TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextYAlignment = Enum.TextYAlignment.Top,
+})
+ui.status.Parent = top
+
+local function fieldRow(order: number, labelText: string, placeholder: string, initial: string)
+	local row = create(&quot;Frame&quot;, {
+		Name = labelText .. &quot;Row&quot;,
+		Size = UDim2.new(1, 0, 0, 26),
+		BackgroundTransparency = 1,
+		LayoutOrder = order,
+	})
+	create(&quot;TextLabel&quot;, {
+		Size = UDim2.new(0, 52, 1, 0),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		Text = labelText,
+		TextColor3 = palette.muted,
+		TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}).Parent = row
+
+	local box = create(&quot;TextBox&quot;, {
+		Position = UDim2.new(0, 56, 0, 0),
+		Size = UDim2.new(1, -56, 1, 0),
+		BackgroundColor3 = palette.panel,
+		BorderSizePixel = 0,
+		ClearTextOnFocus = false,
+		Font = Enum.Font.Code,
+		PlaceholderText = placeholder,
+		Text = initial,
+		TextColor3 = palette.text,
+		TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, {
+		create(&quot;UIPadding&quot;, { PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6) }),
+		create(&quot;UICorner&quot;, { CornerRadius = UDim.new(0, 4) }),
+	})
+	box.Parent = row
+
+	return row, box
+end
+
+local portRow, portBox = fieldRow(3, &quot;Port&quot;, &quot;44755&quot;, tostring(loadSetting(&quot;RobloxMCP_Port&quot;, 44755)))
+portRow.Parent = top
+local tokenRow, tokenBox = fieldRow(4, &quot;Token&quot;, &quot;optional&quot;, tostring(loadSetting(&quot;RobloxMCP_Token&quot;, &quot;&quot;)))
+tokenRow.Parent = top
+
+local buttons = create(&quot;Frame&quot;, {
+	Name = &quot;Buttons&quot;,
+	Size = UDim2.new(1, 0, 0, 28),
+	BackgroundTransparency = 1,
+	LayoutOrder = 5,
+}, {
+	create(&quot;UIListLayout&quot;, {
+		FillDirection = Enum.FillDirection.Horizontal,
+		Padding = UDim.new(0, 6),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	}),
+})
+buttons.Parent = top
+
+local function makeButton(text: string, color: Color3, order: number, width: number)
+	local button = create(&quot;TextButton&quot;, {
+		Name = text,
+		Size = UDim2.new(0, width, 1, 0),
+		BackgroundColor3 = color,
+		BorderSizePixel = 0,
+		AutoButtonColor = true,
+		Font = Enum.Font.GothamBold,
+		Text = text,
+		TextColor3 = palette.text,
+		TextSize = 12,
+		LayoutOrder = order,
+	}, { create(&quot;UICorner&quot;, { CornerRadius = UDim.new(0, 4) }) })
+	button.Parent = buttons
+	return button
+end
+
+ui.connect = makeButton(&quot;Connect&quot;, palette.accent, 1, 92)
+ui.disconnect = makeButton(&quot;Disconnect&quot;, palette.panel, 2, 96)
+ui.selftest = makeButton(&quot;Self-test&quot;, palette.panel, 3, 82)
+
+ui.info = create(&quot;TextLabel&quot;, {
+	Name = &quot;Info&quot;,
+	LayoutOrder = 6,
+	Size = UDim2.new(1, 0, 0, 0),
+	AutomaticSize = Enum.AutomaticSize.Y,
+	BackgroundTransparency = 1,
+	Font = Enum.Font.Gotham,
+	Text = &quot;&quot;,
+	TextColor3 = palette.muted,
+	TextSize = 11,
+	TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextYAlignment = Enum.TextYAlignment.Top,
+})
+ui.info.Parent = top
+
+local logScroll = create(&quot;ScrollingFrame&quot;, {
+	Name = &quot;Log&quot;,
+	Position = UDim2.new(0, 10, 0, 246),
+	Size = UDim2.new(1, -20, 1, -256),
+	BackgroundColor3 = Color3.fromRGB(28, 29, 33),
+	BorderSizePixel = 0,
+	CanvasSize = UDim2.new(0, 0, 0, 0),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	ScrollBarImageColor3 = palette.muted,
+	ScrollBarThickness = 4,
+}, {
+	create(&quot;UIPadding&quot;, { PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6), PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6) }),
+	create(&quot;UIListLayout&quot;, {
+		Padding = UDim.new(0, 3),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	}),
+	create(&quot;UICorner&quot;, { CornerRadius = UDim.new(0, 4) }),
+})
+logScroll.Parent = root
+
+local logCount = 0
+
+local function logLine(text: string, color: Color3?)
+	logCount += 1
+	local label = create(&quot;TextLabel&quot;, {
+		Name = &quot;Line&quot; .. tostring(logCount),
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Code,
+		Text = (&quot;%s  %s&quot;):format(os.date(&quot;%H:%M:%S&quot;), text),
+		TextColor3 = color or palette.text,
+		TextSize = 11,
+		TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		LayoutOrder = logCount,
+	})
+	label.Parent = logScroll
+
+	local lines = {}
+	for _, child in ipairs(logScroll:GetChildren()) do
+		if child:IsA(&quot;TextLabel&quot;) then
+			table.insert(lines, child)
+		end
+	end
+	if #lines &gt; 120 then
+		for index = 1, #lines - 120 do
+			lines[index]:Destroy()
+		end
+	end
+	logScroll.CanvasPosition = Vector2.new(0, 1e6)
+end
+
+local function setStatus(text: string, connected: boolean?)
+	ui.status.Text = text
+	if connected == nil then
+		return
+	end
+	state.connected = connected
+	ui.dot.BackgroundColor3 = connected and palette.ok or palette.bad
+end
+
+local function updateInfo()
+	local mode = RunService:IsRunning() and &quot;play&quot; or &quot;edit&quot;
+	ui.info.Text = (&quot;%s  |  %s mode  |  %d calls served  |  port %d&quot;):format(game.Name, mode, state.served, state.port)
+end
+
+-- -------------------------------------------------------------------- bridge
+
+local function flushLogs()
+	if not currentApi or #pendingLogs == 0 then
+		return
+	end
+	local batch = pendingLogs
+	pendingLogs = {}
+	for _, entry in ipairs(batch) do
+		currentApi:post(&quot;/v1/event&quot;, { type = &quot;log&quot;, data = entry })
+	end
+end
+
+local function queueLog(entry)
+	table.insert(pendingLogs, entry)
+	if #pendingLogs &gt; 100 then
+		table.remove(pendingLogs, 1)
+	end
+end
+
+local function respond(api, id: string, ok: boolean, result: any, err: any)
+	local payload = { id = id, ok = ok }
+	if ok then
+		local encodedOk, encoded = pcall(Codec.encode, result)
+		if encodedOk then
+			payload.result = encoded
+		else
+			payload.ok = false
+			payload.error = { code = &quot;encode_failed&quot;, message = &quot;could not encode result: &quot; .. tostring(encoded) }
+		end
+	else
+		payload.error = err
+	end
+	api:post(&quot;/v1/result&quot;, payload)
+end
+
+local function dispatch(api, request)
+	local method = tostring(request.method or &quot;&quot;)
+	local params = type(request.params) == &quot;table&quot; and request.params or {}
+	local handler = Ops[method]
+
+	if type(handler) ~= &quot;function&quot; then
+		respond(api, request.id, false, nil, {
+			code = &quot;unknown_method&quot;,
+			message = (&quot;RobloxMCP has no method %q. Update the plugin and server together.&quot;):format(method),
+		})
+		return
+	end
+
+	local recording = nil
+	if not Ops.noRecording[method] then
+		pcall(function()
+			recording = ChangeHistoryService:TryBeginRecording(&quot;RobloxMCP: &quot; .. method)
+		end)
+	end
+
+	local ok, result = pcall(handler, params)
+
+	if recording then
+		pcall(function()
+			ChangeHistoryService:FinishRecording(
+				recording,
+				ok and Enum.FinishRecordingOperation.Commit or Enum.FinishRecordingOperation.Cancel
+			)
+		end)
+	end
+
+	if ok then
+		respond(api, request.id, true, result)
+	else
+		local err
+		if type(result) == &quot;table&quot; and result.code then
+			err = { code = tostring(result.code), message = tostring(result.message) }
+		else
+			err = { code = &quot;studio_error&quot;, message = tostring(result) }
+		end
+		logLine(err.message, palette.bad)
+		respond(api, request.id, false, nil, err)
+	end
+end
+
+local function helloPayload()
+	local placeId = 0
+	pcall(function()
+		placeId = game.PlaceId
+	end)
+	local studioVersion = &quot;&quot;
+	pcall(function()
+		studioVersion = version()
+	end)
+	return {
+		protocol = PROTOCOL,
+		placeName = game.Name,
+		placeId = placeId,
+		pluginVersion = Ops.PLUGIN_VERSION,
+		studioVersion = studioVersion,
+		mode = RunService:IsRunning() and &quot;play&quot; or &quot;edit&quot;,
+	}
+end
+
+local function connectLoop()
+	while true do
+		if state.running then
+			local api = Api.new(state.port, state.token)
+			local ok, hello = api:post(&quot;/v1/hello&quot;, helloPayload())
+
+			if not ok then
+				setStatus((&quot;Waiting for the MCP server on port %d: %s&quot;):format(state.port, tostring(hello)), false)
+				state.lastError = tostring(hello)
+				task.wait(2)
+			else
+				currentApi = api
+				state.lastError = &quot;&quot;
+				setStatus((&quot;Connected to MCP server %s (port %d)&quot;):format(tostring(type(hello) == &quot;table&quot; and hello.serverVersion or &quot;?&quot;), state.port), true)
+				logLine((&quot;connected on port %d&quot;):format(state.port), palette.ok)
+				updateInfo()
+				flushLogs()
+
+				while state.running do
+					local pollOk, payload = api:get((&quot;/v1/poll?timeout=%d&quot;):format(POLL_TIMEOUT_SECONDS))
+					if not pollOk then
+						setStatus((&quot;Disconnected: %s&quot;):format(tostring(payload)), false)
+						logLine(&quot;poll failed: &quot; .. tostring(payload), palette.bad)
+						break
+					end
+					if payload and payload.request then
+						state.served += 1
+						dispatch(api, payload.request)
+						updateInfo()
+					end
+					flushLogs()
+				end
+
+				currentApi = nil
+			end
+		else
+			task.wait(0.25)
+		end
+	end
+end
+
+Ops.startLogCapture(queueLog)
+
+-- Forward selection changes so the server (and agents) can see what is selected.
+do
+	local lastSent = 0
+	Selection.SelectionChanged:Connect(function()
+		if not state.connected or not currentApi then
+			return
+		end
+		local now = os.clock()
+		if now - lastSent &lt; 0.4 then
+			return
+		end
+		lastSent = now
+		local selected = Ops.getSelection().selection
+		currentApi:post(&quot;/v1/event&quot;, { type = &quot;selection&quot;, data = selected })
+	end)
+end
+
+task.spawn(function()
+	while true do
+		task.wait(1)
+		if state.connected then
+			flushLogs()
+		end
+	end
+end)
+
+-- ------------------------------------------------------------------ controls
+
+toolbarButton.Click:Connect(function()
+	widget.Enabled = not widget.Enabled
+end)
+
+ui.connect.MouseButton1Click:Connect(function()
+	local port = math.floor(tonumber(portBox.Text) or 0)
+	if port &lt;= 0 or port &gt; 65535 then
+		setStatus(&quot;Port must be a number between 1 and 65535.&quot;, false)
+		return
+	end
+	state.port = port
+	state.token = tokenBox.Text
+	saveSetting(&quot;RobloxMCP_Port&quot;, port)
+	saveSetting(&quot;RobloxMCP_Token&quot;, state.token)
+	state.running = true
+	setStatus((&quot;Connecting to 127.0.0.1:%d ...&quot;):format(port), false)
+	updateInfo()
+end)
+
+ui.disconnect.MouseButton1Click:Connect(function()
+	state.running = false
+	currentApi = nil
+	setStatus(&quot;Disconnected. Press Connect to attach again.&quot;, false)
+end)
+
+ui.selftest.MouseButton1Click:Connect(function()
+	local ok, result = pcall(Ops.selftest)
+	if not ok then
+		logLine(&quot;self-test failed: &quot; .. tostring(result), palette.bad)
+		return
+	end
+	for _, check in ipairs(result.checks) do
+		logLine((&quot;%s: %s (%s)&quot;):format(check.name, check.ok and &quot;ok&quot; or &quot;FAIL&quot;, check.detail), check.ok and palette.text or palette.bad)
+	end
+end)
+
+plugin.Unloading:Connect(function()
+	state.running = false
+end)
+
+-- Startup: try once, but do not spam retries when no server is running.
+task.spawn(function()
+	task.wait(0.5)
+	updateInfo()
+	if loadSetting(&quot;RobloxMCP_ConnectOnLoad&quot;, true) == false then
+		setStatus(&quot;Idle. Press Connect to attach to the MCP server.&quot;, false)
+		return
+	end
+	state.port = math.floor(tonumber(portBox.Text) or 44755)
+	state.token = tokenBox.Text
+	local api = Api.new(state.port, state.token)
+	local ok, hello = api:post(&quot;/v1/hello&quot;, helloPayload())
+	if ok then
+		state.running = true
+		logLine((&quot;auto-connected on port %d&quot;):format(state.port), palette.ok)
+	else
+		setStatus((&quot;MCP server not running on port %d. Start it with `npm start`, then press Connect.\n%s&quot;):format(state.port, tostring(hello)), false)
+	end
+end)
+
+task.spawn(connectLoop)
+logLine(&quot;plugin loaded&quot;, palette.muted)
+</ProtectedString>
+    </Properties>
+  <Item class="ModuleScript" referent="RBX1">
+    <Properties>
+      <string name="Name">Api</string>
+      <ProtectedString name="Source">--!nonstrict
+local HttpService = game:GetService(&quot;HttpService&quot;)
+
+local Api = {}
+Api.__index = Api
+
+function Api.new(port: number, token: string)
+	return setmetatable({
+		base = (&quot;http://127.0.0.1:%d&quot;):format(port),
+		token = token or &quot;&quot;,
+	}, Api)
+end
+
+local function describeFailure(response)
+	if type(response) ~= &quot;table&quot; then
+		return tostring(response)
+	end
+	if response.StatusCode == 0 then
+		return &quot;connection refused (is the MCP server running?)&quot;
+	end
+	local ok, decoded = pcall(function()
+		return HttpService:JSONDecode(response.Body or &quot;&quot;)
+	end)
+	if ok and type(decoded) == &quot;table&quot; and decoded.error and decoded.error.message then
+		return tostring(decoded.error.message)
+	end
+	local body = response.Body or &quot;&quot;
+	if #body &gt; 240 then
+		body = string.sub(body, 1, 240) .. &quot;...&quot;
+	end
+	return (&quot;HTTP %d %s&quot;):format(response.StatusCode, body)
+end
+
+function Api:request(method: string, path: string, body: any): (boolean, any)
+	local options = {
+		Url = self.base .. path,
+		Method = method,
+		Headers = {
+			[&quot;Content-Type&quot;] = &quot;application/json&quot;,
+		},
+	}
+
+	if self.token ~= &quot;&quot; then
+		options.Headers[&quot;x-roblox-mcp-token&quot;] = self.token
+	end
+
+	if body ~= nil then
+		local okEncode, encoded = pcall(function()
+			return HttpService:JSONEncode(body)
+		end)
+		if not okEncode then
+			return false, &quot;could not encode request body: &quot; .. tostring(encoded)
+		end
+		options.Body = encoded
+	end
+
+	local ok, response = pcall(function()
+		return HttpService:RequestAsync(options)
+	end)
+	if not ok then
+		return false, tostring(response)
+	end
+	if type(response) ~= &quot;table&quot; then
+		return false, &quot;unexpected HttpService response&quot;
+	end
+
+	if response.StatusCode == 204 then
+		return true, nil
+	end
+	if not response.Success then
+		return false, describeFailure(response)
+	end
+	if response.Body == nil or response.Body == &quot;&quot; then
+		return true, nil
+	end
+
+	local okDecode, decoded = pcall(function()
+		return HttpService:JSONDecode(response.Body)
+	end)
+	if not okDecode then
+		return false, &quot;invalid JSON from server: &quot; .. tostring(decoded)
+	end
+	return true, decoded
+end
+
+function Api:get(path: string): (boolean, any)
+	return self:request(&quot;GET&quot;, path, nil)
+end
+
+function Api:post(path: string, body: any): (boolean, any)
+	return self:request(&quot;POST&quot;, path, body)
+end
+
+return Api
+</ProtectedString>
+    </Properties>
+  </Item>
+  <Item class="ModuleScript" referent="RBX2">
+    <Properties>
+      <string name="Name">Codec</string>
+      <ProtectedString name="Source">--!nonstrict
+-- Converts Roblox datatypes to readable JSON and back.
+--
+-- Wire format examples:
+--   Vector3   { &quot;__type&quot;: &quot;Vector3&quot;, &quot;x&quot;: 0, &quot;y&quot;: 5, &quot;z&quot;: 0 }
+--   CFrame    { &quot;__type&quot;: &quot;CFrame&quot;, &quot;components&quot;: [12 numbers] }
+--   Color3    { &quot;__type&quot;: &quot;Color3&quot;, &quot;r&quot;: 1, &quot;g&quot;: 0.5, &quot;b&quot;: 0 }
+--   UDim2     { &quot;__type&quot;: &quot;UDim2&quot;, &quot;xs&quot;: 0, &quot;xo&quot;: 100, &quot;ys&quot;: 0, &quot;yo&quot;: 50 }
+--   Enum      { &quot;__type&quot;: &quot;Enum&quot;, &quot;enumType&quot;: &quot;Material&quot;, &quot;name&quot;: &quot;Neon&quot; }
+--   Instance  { &quot;__type&quot;: &quot;Instance&quot;, &quot;path&quot;: &quot;game.Workspace.Part&quot; }
+
+local Paths = require(script.Parent.Paths)
+
+local Codec = {}
+
+local MAX_DEPTH = 10
+local MAX_STRING = 250_000
+
+local function numberOr(value: any, fallback: number): number
+	if type(value) == &quot;number&quot; then
+		return value
+	end
+	local parsed = tonumber(value)
+	return parsed or fallback
+end
+
+local function color(value: Color3)
+	return { __type = &quot;Color3&quot;, r = value.R, g = value.G, b = value.B }
+end
+
+local function encodeNumber(value: number): any
+	if value ~= value then
+		return { __type = &quot;number&quot;, value = &quot;nan&quot; }
+	end
+	if value == math.huge then
+		return { __type = &quot;number&quot;, value = &quot;inf&quot; }
+	end
+	if value == -math.huge then
+		return { __type = &quot;number&quot;, value = &quot;-inf&quot; }
+	end
+	return value
+end
+
+-- `Enum.Material.Name` is not readable from plugins in every Studio build, so
+-- derive the enum type from the item's string form (&quot;Enum.Material.Neon&quot;).
+function Codec.enumInfo(enumItem: any): (string?, string?)
+	local ok, text = pcall(tostring, enumItem)
+	if not ok or type(text) ~= &quot;string&quot; then
+		return nil, nil
+	end
+	return string.match(text, &quot;^Enum%.([%w_]+)%.([%w_]+)$&quot;)
+end
+
+function Codec.enumTypeName(enumItem: any): string?
+	local enumName = Codec.enumInfo(enumItem)
+	return enumName
+end
+
+local function encodeValue(value: any, depth: number, seen: { [any]: boolean }): any
+	if value == nil then
+		return nil
+	end
+
+	local valueType = typeof(value)
+	if valueType == &quot;string&quot; then
+		if #value &gt; MAX_STRING then
+			return string.sub(value, 1, MAX_STRING) .. &quot;\n-- [truncated by RobloxMCP]&quot;
+		end
+		return value
+	elseif valueType == &quot;boolean&quot; then
+		return value
+	elseif valueType == &quot;number&quot; then
+		return encodeNumber(value)
+	elseif valueType == &quot;Instance&quot; then
+		return { __type = &quot;Instance&quot;, path = Paths.of(value), className = value.ClassName }
+	elseif valueType == &quot;EnumItem&quot; then
+		local enumType, itemName = Codec.enumInfo(value)
+		return { __type = &quot;Enum&quot;, enumType = enumType, name = itemName or tostring(value), value = value.Value }
+	elseif valueType == &quot;Vector3&quot; then
+		return { __type = &quot;Vector3&quot;, x = value.X, y = value.Y, z = value.Z }
+	elseif valueType == &quot;Vector2&quot; then
+		return { __type = &quot;Vector2&quot;, x = value.X, y = value.Y }
+	elseif valueType == &quot;CFrame&quot; then
+		local components = { value:GetComponents() }
+		return { __type = &quot;CFrame&quot;, components = components, position = { value.X, value.Y, value.Z } }
+	elseif valueType == &quot;Color3&quot; then
+		return color(value)
+	elseif valueType == &quot;BrickColor&quot; then
+		return { __type = &quot;BrickColor&quot;, name = value.Name, number = value.Number }
+	elseif valueType == &quot;UDim&quot; then
+		return { __type = &quot;UDim&quot;, scale = value.Scale, offset = value.Offset }
+	elseif valueType == &quot;UDim2&quot; then
+		return { __type = &quot;UDim2&quot;, xs = value.X.Scale, xo = value.X.Offset, ys = value.Y.Scale, yo = value.Y.Offset }
+	elseif valueType == &quot;Rect&quot; then
+		return { __type = &quot;Rect&quot;, minX = value.Min.X, minY = value.Min.Y, maxX = value.Max.X, maxY = value.Max.Y }
+	elseif valueType == &quot;NumberRange&quot; then
+		return { __type = &quot;NumberRange&quot;, min = value.Min, max = value.Max }
+	elseif valueType == &quot;NumberSequence&quot; then
+		local keypoints = {}
+		for _, keypoint in ipairs(value.Keypoints) do
+			table.insert(keypoints, { time = keypoint.Time, value = keypoint.Value, envelope = keypoint.Envelope })
+		end
+		return { __type = &quot;NumberSequence&quot;, keypoints = keypoints }
+	elseif valueType == &quot;ColorSequence&quot; then
+		local keypoints = {}
+		for _, keypoint in ipairs(value.Keypoints) do
+			table.insert(keypoints, { time = keypoint.Time, color = color(keypoint.Value), envelope = keypoint.Envelope })
+		end
+		return { __type = &quot;ColorSequence&quot;, keypoints = keypoints }
+	elseif valueType == &quot;PhysicalProperties&quot; then
+		return {
+			__type = &quot;PhysicalProperties&quot;,
+			density = value.Density,
+			friction = value.Friction,
+			elasticity = value.Elasticity,
+			frictionWeight = value.FrictionWeight,
+			elasticityWeight = value.ElasticityWeight,
+		}
+	elseif valueType == &quot;Font&quot; then
+		return { __type = &quot;Font&quot;, family = value.Family, weight = value.Weight.Name, style = value.Style.Name }
+	elseif valueType == &quot;TweenInfo&quot; then
+		return {
+			__type = &quot;TweenInfo&quot;,
+			time = value.Time,
+			delayTime = value.DelayTime,
+			repeatCount = value.RepeatCount,
+			reverses = value.Reverses,
+			easingStyle = value.EasingStyle.Name,
+			easingDirection = value.EasingDirection.Name,
+		}
+	elseif valueType == &quot;Axes&quot; then
+		return { __type = &quot;Axes&quot;, x = value.X, y = value.Y, z = value.Z }
+	end
+
+	if type(value) == &quot;table&quot; then
+		if depth &gt;= MAX_DEPTH then
+			return &quot;[max-depth]&quot;
+		end
+		if seen[value] then
+			return &quot;[cycle]&quot;
+		end
+		seen[value] = true
+
+		local count = 0
+		local isArray = true
+		for key in pairs(value) do
+			count += 1
+			if type(key) ~= &quot;number&quot; then
+				isArray = false
+				break
+			end
+		end
+		if isArray then
+			for index = 1, count do
+				if value[index] == nil then
+					isArray = false
+					break
+				end
+			end
+		end
+
+		local encoded
+		if isArray then
+			encoded = {}
+			for index = 1, count do
+				encoded[index] = encodeValue(value[index], depth + 1, seen)
+			end
+		else
+			encoded = {}
+			for key, item in pairs(value) do
+				local keyName = type(key) == &quot;string&quot; and key or tostring(key)
+				encoded[keyName] = encodeValue(item, depth + 1, seen)
+			end
+		end
+
+		seen[value] = nil
+		return encoded
+	end
+
+	return { __type = valueType, value = tostring(value) }
+end
+
+function Codec.encode(value: any): any
+	return encodeValue(value, 0, {})
+end
+
+-- --------------------------------------------------------------- datatypes
+
+local function toVector3(value: any): Vector3?
+	if typeof(value) == &quot;Vector3&quot; then
+		return value
+	end
+	if type(value) == &quot;table&quot; then
+		if value.x ~= nil and value.y ~= nil and value.z ~= nil then
+			return Vector3.new(numberOr(value.x, 0), numberOr(value.y, 0), numberOr(value.z, 0))
+		end
+		if value[1] ~= nil and value[2] ~= nil and value[3] ~= nil then
+			return Vector3.new(numberOr(value[1], 0), numberOr(value[2], 0), numberOr(value[3], 0))
+		end
+	end
+	if type(value) == &quot;string&quot; then
+		local x, y, z = string.match(value, &quot;^%s*([%d%.%-e]+)%s*,%s*([%d%.%-e]+)%s*,%s*([%d%.%-e]+)%s*$&quot;)
+		if x then
+			return Vector3.new(tonumber(x) or 0, tonumber(y) or 0, tonumber(z) or 0)
+		end
+	end
+	return nil
+end
+
+local function toVector2(value: any): Vector2?
+	if typeof(value) == &quot;Vector2&quot; then
+		return value
+	end
+	if type(value) == &quot;table&quot; then
+		if value.x ~= nil and value.y ~= nil then
+			return Vector2.new(numberOr(value.x, 0), numberOr(value.y, 0))
+		end
+		if value[1] ~= nil and value[2] ~= nil then
+			return Vector2.new(numberOr(value[1], 0), numberOr(value[2], 0))
+		end
+	end
+	return nil
+end
+
+local function toColor3(value: any): Color3?
+	if typeof(value) == &quot;Color3&quot; then
+		return value
+	end
+	if type(value) == &quot;string&quot; then
+		local hex = string.match(value, &quot;^#?(%x%x%x%x%x%x)$&quot;)
+		if hex then
+			return Color3.fromHex(hex)
+		end
+		local ok, brick = pcall(function()
+			return BrickColor.new(value)
+		end)
+		if ok and brick then
+			return brick.Color
+		end
+		return nil
+	end
+	if type(value) == &quot;table&quot; then
+		local r = value.r or value[1] or value.R
+		local g = value.g or value[2] or value.G
+		local b = value.b or value[3] or value.B
+		if r ~= nil and g ~= nil and b ~= nil then
+			r, g, b = numberOr(r, 0), numberOr(g, 0), numberOr(b, 0)
+			if r &gt; 1 or g &gt; 1 or b &gt; 1 then
+				return Color3.fromRGB(r, g, b)
+			end
+			return Color3.new(r, g, b)
+		end
+	end
+	return nil
+end
+
+local function toCFrame(value: any): CFrame?
+	if typeof(value) == &quot;CFrame&quot; then
+		return value
+	end
+	if type(value) == &quot;table&quot; then
+		local components = value.components
+		if type(components) == &quot;table&quot; and #components == 12 then
+			return CFrame.new(unpack(components))
+		end
+		local position = value.position or value[1]
+		if position ~= nil then
+			local vector = toVector3(position)
+			if vector then
+				return CFrame.new(vector)
+			end
+		end
+		local x, y, z = value.x, value.y, value.z
+		if x ~= nil and y ~= nil and z ~= nil then
+			return CFrame.new(numberOr(x, 0), numberOr(y, 0), numberOr(z, 0))
+		end
+	end
+	if type(value) == &quot;string&quot; then
+		local x, y, z = string.match(value, &quot;^%s*([%d%.%-e]+)%s*,%s*([%d%.%-e]+)%s*,%s*([%d%.%-e]+)%s*$&quot;)
+		if x then
+			return CFrame.new(tonumber(x) or 0, tonumber(y) or 0, tonumber(z) or 0)
+		end
+	end
+	return nil
+end
+
+local function toUDim(value: any): UDim?
+	if typeof(value) == &quot;UDim&quot; then
+		return value
+	end
+	if type(value) == &quot;table&quot; and value.scale ~= nil and value.offset ~= nil then
+		return UDim.new(numberOr(value.scale, 0), numberOr(value.offset, 0))
+	end
+	if type(value) == &quot;number&quot; then
+		return UDim.new(0, value)
+	end
+	return nil
+end
+
+local function toUDim2(value: any): UDim2?
+	if typeof(value) == &quot;UDim2&quot; then
+		return value
+	end
+	if type(value) == &quot;table&quot; then
+		if value.xs ~= nil and value.xo ~= nil and value.ys ~= nil and value.yo ~= nil then
+			return UDim2.new(numberOr(value.xs, 0), numberOr(value.xo, 0), numberOr(value.ys, 0), numberOr(value.yo, 0))
+		end
+		if value[1] ~= nil and value[2] ~= nil and value[3] ~= nil and value[4] ~= nil then
+			return UDim2.new(numberOr(value[1], 0), numberOr(value[2], 0), numberOr(value[3], 0), numberOr(value[4], 0))
+		end
+		if value.x ~= nil and value.y ~= nil then
+			local x = toUDim(value.x)
+			local y = toUDim(value.y)
+			if x and y then
+				return UDim2.new(x, y)
+			end
+		end
+	end
+	if type(value) == &quot;string&quot; then
+		local xs, xo, ys, yo = string.match(value, &quot;^%s*([%d%.%-]+)%s*,%s*([%d%.%-]+)%s*,%s*([%d%.%-]+)%s*,%s*([%d%.%-]+)%s*$&quot;)
+		if xs then
+			return UDim2.new(tonumber(xs) or 0, tonumber(xo) or 0, tonumber(ys) or 0, tonumber(yo) or 0)
+		end
+	end
+	return nil
+end
+
+local function toRect(value: any): Rect?
+	if typeof(value) == &quot;Rect&quot; then
+		return value
+	end
+	if type(value) == &quot;table&quot; then
+		if value.minX ~= nil and value.maxX ~= nil then
+			return Rect.new(value.minX, value.minY or 0, value.maxX, value.maxY or 0)
+		end
+		if value[1] ~= nil and value[2] ~= nil and value[3] ~= nil and value[4] ~= nil then
+			return Rect.new(value[1], value[2], value[3], value[4])
+		end
+	end
+	return nil
+end
+
+local function toNumberRange(value: any): NumberRange?
+	if typeof(value) == &quot;NumberRange&quot; then
+		return value
+	end
+	if type(value) == &quot;table&quot; and value.min ~= nil and value.max ~= nil then
+		return NumberRange.new(numberOr(value.min, 0), numberOr(value.max, 0))
+	end
+	if type(value) == &quot;number&quot; then
+		return NumberRange.new(value)
+	end
+	return nil
+end
+
+local function toNumberSequence(value: any): NumberSequence?
+	if typeof(value) == &quot;NumberSequence&quot; then
+		return value
+	end
+	if type(value) == &quot;table&quot; and type(value.keypoints) == &quot;table&quot; then
+		local points = {}
+		for _, point in ipairs(value.keypoints) do
+			table.insert(points, NumberSequenceKeypoint.new(numberOr(point.time, 0), numberOr(point.value, 0), numberOr(point.envelope, 0)))
+		end
+		if #points &gt; 0 then
+			return NumberSequence.new(points)
+		end
+	end
+	if type(value) == &quot;number&quot; then
+		return NumberSequence.new(value)
+	end
+	return nil
+end
+
+local function toColorSequence(value: any): ColorSequence?
+	if typeof(value) == &quot;ColorSequence&quot; then
+		return value
+	end
+	if type(value) == &quot;table&quot; and type(value.keypoints) == &quot;table&quot; then
+		local points = {}
+		for _, point in ipairs(value.keypoints) do
+			local pointColor = toColor3(point.color) or Color3.new(1, 1, 1)
+			table.insert(points, ColorSequenceKeypoint.new(numberOr(point.time, 0), pointColor))
+		end
+		if #points &gt; 0 then
+			return ColorSequence.new(points)
+		end
+	end
+	return nil
+end
+
+local function toPhysicalProperties(value: any): PhysicalProperties?
+	if typeof(value) == &quot;PhysicalProperties&quot; then
+		return value
+	end
+	if type(value) == &quot;table&quot; then
+		return PhysicalProperties.new(
+			numberOr(value.density, 0.7),
+			numberOr(value.friction, 0.3),
+			numberOr(value.elasticity, 0.5),
+			numberOr(value.frictionWeight, 1),
+			numberOr(value.elasticityWeight, 1)
+		)
+	end
+	return nil
+end
+
+local function toFont(value: any): Font?
+	if typeof(value) == &quot;Font&quot; then
+		return value
+	end
+	if type(value) == &quot;table&quot; and value.family then
+		local weight = value.weight and Enum.FontWeight[value.weight] or Enum.FontWeight.Regular
+		local style = value.style and Enum.FontStyle[value.style] or Enum.FontStyle.Normal
+		return Font.new(value.family, weight, style)
+	end
+	if type(value) == &quot;string&quot; then
+		return Font.new(value)
+	end
+	return nil
+end
+
+local function toEnumItem(value: any, enumTypeName: string?): (EnumItem?, string?)
+	if typeof(value) == &quot;EnumItem&quot; then
+		return value
+	end
+	if type(value) == &quot;number&quot; and enumTypeName then
+		local enum = Enum[enumTypeName]
+		if enum then
+			local ok, item = pcall(function()
+				return enum:FromValue(value)
+			end)
+			if ok then
+				return item
+			end
+		end
+	end
+	local name: string?
+	if type(value) == &quot;string&quot; then
+		local enumName, itemName = string.match(value, &quot;^Enum%.([%w_]+)%.([%w_]+)$&quot;)
+		if enumName then
+			local enum = Enum[enumName]
+			if not enum then
+				return nil, (&quot;Enum.%s does not exist&quot;):format(enumName)
+			end
+			local item = enum[itemName]
+			if not item then
+				return nil, (&quot;Enum.%s has no item %q&quot;):format(enumName, itemName)
+			end
+			return item
+		end
+		name = value
+	elseif type(value) == &quot;table&quot; then
+		enumTypeName = value.enumType or enumTypeName
+		name = value.name
+	end
+
+	if name and enumTypeName then
+		local enum = Enum[enumTypeName]
+		if not enum then
+			return nil, (&quot;Enum.%s does not exist&quot;):format(enumTypeName)
+		end
+		local item = enum[name]
+		if not item then
+			local lower = string.lower(name)
+			for _, candidate in ipairs(enum:GetEnumItems()) do
+				if string.lower(candidate.Name) == lower then
+					return candidate
+				end
+			end
+			return nil, (&quot;Enum.%s has no item %q&quot;):format(enumTypeName, name)
+		end
+		return item
+	end
+
+	return nil, &quot;expected an enum name such as \&quot;Neon\&quot; or \&quot;Enum.Material.Neon\&quot;&quot;
+end
+
+function Codec.decode(value: any): any
+	if type(value) ~= &quot;table&quot; then
+		return value
+	end
+
+	local tag = value.__type
+	if tag == &quot;Vector3&quot; then
+		return toVector3(value)
+	elseif tag == &quot;Vector2&quot; then
+		return toVector2(value)
+	elseif tag == &quot;CFrame&quot; then
+		return toCFrame(value)
+	elseif tag == &quot;Color3&quot; then
+		return toColor3(value)
+	elseif tag == &quot;BrickColor&quot; then
+		return BrickColor.new(value.name or value.number)
+	elseif tag == &quot;UDim&quot; then
+		return toUDim(value)
+	elseif tag == &quot;UDim2&quot; then
+		return toUDim2(value)
+	elseif tag == &quot;Rect&quot; then
+		return toRect(value)
+	elseif tag == &quot;NumberRange&quot; then
+		return toNumberRange(value)
+	elseif tag == &quot;NumberSequence&quot; then
+		return toNumberSequence(value)
+	elseif tag == &quot;ColorSequence&quot; then
+		return toColorSequence(value)
+	elseif tag == &quot;PhysicalProperties&quot; then
+		return toPhysicalProperties(value)
+	elseif tag == &quot;Font&quot; then
+		return toFont(value)
+	elseif tag == &quot;Enum&quot; then
+		return toEnumItem(value)
+	elseif tag == &quot;Instance&quot; then
+		return Paths.resolve(value.path)
+	elseif tag == &quot;number&quot; then
+		if value.value == &quot;nan&quot; then
+			return 0 / 0
+		elseif value.value == &quot;inf&quot; then
+			return math.huge
+		elseif value.value == &quot;-inf&quot; then
+			return -math.huge
+		end
+		return tonumber(value.value) or 0
+	end
+
+	-- Plain table: decode children.
+	local decoded = {}
+	for key, item in pairs(value) do
+		decoded[key] = Codec.decode(item)
+	end
+	return decoded
+end
+
+-- Coerce `value` into the type the property currently holds.
+function Codec.forProperty(instance: Instance, propertyName: string, value: any): any
+	if value == nil then
+		return nil
+	end
+
+	local ok, current = pcall(function()
+		return (instance :: any)[propertyName]
+	end)
+	local currentType = ok and typeof(current) or nil
+
+	if currentType == &quot;EnumItem&quot; then
+		local item, message = toEnumItem(value, Codec.enumTypeName(current))
+		if not item then
+			error(message, 0)
+		end
+		return item
+	elseif currentType == &quot;Instance&quot; then
+		if typeof(value) == &quot;Instance&quot; then
+			return value
+		end
+		return Paths.resolve(tostring(value))
+	elseif currentType == &quot;Vector3&quot; then
+		return toVector3(value) or error((&quot;expected Vector3 for %s, got %s&quot;):format(propertyName, typeof(value)), 0)
+	elseif currentType == &quot;Vector2&quot; then
+		return toVector2(value) or error((&quot;expected Vector2 for %s, got %s&quot;):format(propertyName, typeof(value)), 0)
+	elseif currentType == &quot;CFrame&quot; then
+		return toCFrame(value) or error((&quot;expected CFrame for %s, got %s&quot;):format(propertyName, typeof(value)), 0)
+	elseif currentType == &quot;Color3&quot; then
+		return toColor3(value) or error((&quot;expected Color3 ({\&quot;__type\&quot;:\&quot;Color3\&quot;,...} or \&quot;#ff8800\&quot;) for %s&quot;):format(propertyName), 0)
+	elseif currentType == &quot;BrickColor&quot; then
+		if typeof(value) == &quot;BrickColor&quot; then
+			return value
+		end
+		local okBrick, brick = pcall(function()
+			return BrickColor.new(value)
+		end)
+		if okBrick then
+			return brick
+		end
+		error((&quot;expected a BrickColor name for %s&quot;):format(propertyName), 0)
+	elseif currentType == &quot;UDim&quot; then
+		return toUDim(value) or error((&quot;expected UDim for %s&quot;):format(propertyName), 0)
+	elseif currentType == &quot;UDim2&quot; then
+		return toUDim2(value) or error((&quot;expected UDim2 for %s&quot;):format(propertyName), 0)
+	elseif currentType == &quot;Rect&quot; then
+		return toRect(value) or error((&quot;expected Rect for %s&quot;):format(propertyName), 0)
+	elseif currentType == &quot;NumberRange&quot; then
+		return toNumberRange(value) or error((&quot;expected NumberRange for %s&quot;):format(propertyName), 0)
+	elseif currentType == &quot;NumberSequence&quot; then
+		return toNumberSequence(value) or error((&quot;expected NumberSequence for %s&quot;):format(propertyName), 0)
+	elseif currentType == &quot;ColorSequence&quot; then
+		return toColorSequence(value) or error((&quot;expected ColorSequence for %s&quot;):format(propertyName), 0)
+	elseif currentType == &quot;PhysicalProperties&quot; then
+		return toPhysicalProperties(value) or error((&quot;expected PhysicalProperties for %s&quot;):format(propertyName), 0)
+	elseif currentType == &quot;Font&quot; then
+		return toFont(value) or error((&quot;expected Font for %s&quot;):format(propertyName), 0)
+	elseif currentType == &quot;boolean&quot; and type(value) == &quot;string&quot; then
+		if value == &quot;true&quot; then
+			return true
+		elseif value == &quot;false&quot; then
+			return false
+		end
+	elseif currentType == &quot;number&quot; and type(value) == &quot;string&quot; then
+		return tonumber(value) or error((&quot;expected a number for %s&quot;):format(propertyName), 0)
+	end
+
+	return Codec.decode(value)
+end
+
+return Codec
+</ProtectedString>
+    </Properties>
+  </Item>
+  <Item class="ModuleScript" referent="RBX3">
+    <Properties>
+      <string name="Name">Ops</string>
+      <ProtectedString name="Source">--!nonstrict
+-- Implementation of every bridge method. Each function receives the `params`
+-- table from the MCP server and returns a JSON-encodable result (Codec.encode
+-- is applied by the caller) or raises { code, message }.
+
+local ChangeHistoryService = game:GetService(&quot;ChangeHistoryService&quot;)
+local HttpService = game:GetService(&quot;HttpService&quot;)
+local InsertService = game:GetService(&quot;InsertService&quot;)
+local LogService = game:GetService(&quot;LogService&quot;)
+local RunService = game:GetService(&quot;RunService&quot;)
+local Selection = game:GetService(&quot;Selection&quot;)
+local StudioService = game:GetService(&quot;StudioService&quot;)
+
+local Codec = require(script.Parent.Codec)
+local Paths = require(script.Parent.Paths)
+
+local Ops = {}
+Ops.PLUGIN_VERSION = &quot;1.0.0&quot;
+Ops.logs = {}
+Ops.MAX_LOGS = 500
+
+-- Methods that must not be wrapped in a change-history recording.
+Ops.noRecording = {
+	ping = true,
+	getTree = true,
+	getInstance = true,
+	searchInstances = true,
+	getSelection = true,
+	getScriptSource = true,
+	getLogs = true,
+	selftest = true,
+	history = true,
+}
+
+local scriptEditorService = nil
+do
+	local ok, service = pcall(function()
+		return game:GetService(&quot;ScriptEditorService&quot;)
+	end)
+	if ok then
+		scriptEditorService = service
+	end
+end
+
+local COMMON_PROPERTIES = {
+	&quot;Name&quot;, &quot;Parent&quot;, &quot;Anchored&quot;, &quot;CanCollide&quot;, &quot;CanQuery&quot;, &quot;CanTouch&quot;, &quot;CastShadow&quot;, &quot;Color&quot;,
+	&quot;Material&quot;, &quot;Size&quot;, &quot;CFrame&quot;, &quot;Position&quot;, &quot;Orientation&quot;, &quot;Transparency&quot;, &quot;Reflectance&quot;, &quot;Massless&quot;,
+	&quot;Shape&quot;, &quot;Enabled&quot;, &quot;RunContext&quot;, &quot;Source&quot;, &quot;Text&quot;, &quot;TextColor3&quot;, &quot;TextSize&quot;, &quot;Font&quot;, &quot;Visible&quot;,
+	&quot;BackgroundColor3&quot;, &quot;BackgroundTransparency&quot;, &quot;BorderSizePixel&quot;, &quot;Image&quot;, &quot;ZIndex&quot;, &quot;LayoutOrder&quot;,
+	&quot;Value&quot;, &quot;PrimaryPart&quot;, &quot;Health&quot;, &quot;WalkSpeed&quot;, &quot;JumpPower&quot;, &quot;MaxHealth&quot;, &quot;SoundId&quot;, &quot;Volume&quot;,
+	&quot;PlaybackSpeed&quot;, &quot;Looped&quot;, &quot;Playing&quot;, &quot;TimePosition&quot;, &quot;Ambient&quot;, &quot;Brightness&quot;, &quot;ClockTime&quot;,
+	&quot;Density&quot;, &quot;Friction&quot;, &quot;Elasticity&quot;, &quot;Gravity&quot;, &quot;Level&quot;, &quot;Title&quot;, &quot;PlaceholderText&quot;, &quot;TextEditable&quot;,
+}
+
+local function fail(code: string, message: string)
+	error({ code = code, message = message }, 0)
+end
+
+local function clamp(value: number, minimum: number, maximum: number): number
+	return math.min(maximum, math.max(minimum, value))
+end
+
+local function countLines(text: string): number
+	local _, newlines = string.gsub(text, &quot;\n&quot;, &quot;&quot;)
+	return newlines + 1
+end
+
+local function levelOf(messageType: EnumItem): string
+	local name = messageType.Name
+	if name == &quot;MessageWarning&quot; then
+		return &quot;warning&quot;
+	elseif name == &quot;MessageError&quot; then
+		return &quot;error&quot;
+	elseif name == &quot;MessageInfo&quot; then
+		return &quot;info&quot;
+	end
+	return &quot;message&quot;
+end
+
+local function readSource(instance: Instance): string
+	if not instance:IsA(&quot;LuaSourceContainer&quot;) then
+		fail(&quot;not_a_script&quot;, (&quot;%s (%s) is not a Script, LocalScript or ModuleScript&quot;):format(instance.Name, instance.ClassName))
+	end
+	local ok, source = pcall(function()
+		return (instance :: any).Source
+	end)
+	if not ok then
+		fail(&quot;source_unavailable&quot;, (&quot;cannot read Source of %s: %s&quot;):format(Paths.of(instance), tostring(source)))
+	end
+	return source
+end
+
+local function writeSource(instance: Instance, source: string)
+	local ok, message = pcall(function()
+		(instance :: any).Source = source
+	end)
+	if not ok then
+		fail(&quot;source_write_failed&quot;, (&quot;cannot write Source of %s: %s&quot;):format(Paths.of(instance), tostring(message)))
+	end
+
+	-- Keep an open editor tab in sync. Failure here is not fatal: the data model
+	-- already holds the new source.
+	if scriptEditorService then
+		pcall(function()
+			scriptEditorService:UpdateSourceAsync(instance, function()
+				return source
+			end)
+		end)
+	end
+end
+
+function Ops.applyProperties(instance: Instance, properties: any, attributes: any)
+	local applied = {}
+	local errors = {}
+
+	for name, value in pairs(properties or {}) do
+		if name ~= &quot;Parent&quot; and name ~= &quot;Attributes&quot; then
+			local ok, message = pcall(function()
+				(instance :: any)[name] = Codec.forProperty(instance, name, value)
+			end)
+			if ok then
+				table.insert(applied, name)
+			else
+				table.insert(errors, { property = name, message = tostring(message) })
+			end
+		end
+	end
+
+	for name, value in pairs(attributes or {}) do
+		local ok, message = pcall(function()
+			instance:SetAttribute(name, value)
+		end)
+		if ok then
+			table.insert(applied, &quot;Attribute:&quot; .. name)
+		else
+			table.insert(errors, { property = &quot;Attribute:&quot; .. name, message = tostring(message) })
+		end
+	end
+
+	return applied, errors
+end
+
+function Ops.snapshot(instance: Instance, names: { string })
+	local properties = {}
+	for _, name in ipairs(names) do
+		local ok, value = pcall(function()
+			return (instance :: any)[name]
+		end)
+		if ok then
+			properties[name] = Codec.encode(value)
+		end
+	end
+	return properties
+end
+
+function Ops.defaultProperties(instance: Instance): { string }
+	local names = {}
+	local ok, listed = pcall(function()
+		return (instance :: any):GetProperties()
+	end)
+	if ok and type(listed) == &quot;table&quot; and #listed &gt; 0 then
+		for _, name in ipairs(listed) do
+			if type(name) == &quot;string&quot; then
+				table.insert(names, name)
+			end
+		end
+	else
+		for _, name in ipairs(COMMON_PROPERTIES) do
+			local readable = pcall(function()
+				return (instance :: any)[name]
+			end)
+			if readable then
+				table.insert(names, name)
+			end
+		end
+	end
+	table.sort(names)
+	if #names &gt; 120 then
+		names = { table.unpack(names, 1, 120) }
+	end
+	return names
+end
+
+function Ops.describe(instance: Instance, depth: number, includeProperties: boolean)
+	local node = {
+		name = instance.Name,
+		className = instance.ClassName,
+		path = Paths.of(instance),
+		depth = depth,
+		childCount = #instance:GetChildren(),
+	}
+	if instance:IsA(&quot;LuaSourceContainer&quot;) then
+		local ok, source = pcall(function()
+			return (instance :: any).Source
+		end)
+		if ok then
+			node.lineCount = countLines(source)
+		end
+	end
+	if includeProperties then
+		node.properties = Ops.snapshot(instance, Ops.defaultProperties(instance))
+	end
+	return node
+end
+
+-- ------------------------------------------------------------------- methods
+
+function Ops.ping()
+	local placeId = 0
+	pcall(function()
+		placeId = game.PlaceId
+	end)
+	local userId = 0
+	pcall(function()
+		userId = StudioService:GetUserId()
+	end)
+	local studioVersion = &quot;&quot;
+	pcall(function()
+		studioVersion = version()
+	end)
+
+	return {
+		placeName = game.Name,
+		placeId = placeId,
+		mode = RunService:IsRunning() and &quot;play&quot; or &quot;edit&quot;,
+		pluginVersion = Ops.PLUGIN_VERSION,
+		studioVersion = studioVersion,
+		httpEnabled = HttpService.HttpEnabled,
+		userId = userId,
+		isRunning = RunService:IsRunning(),
+	}
+end
+
+function Ops.getTree(params)
+	local root = Paths.resolve(params.path)
+	local depth = clamp(math.floor(tonumber(params.depth) or 2), 1, 6)
+	local maxNodes = clamp(math.floor(tonumber(params.maxNodes) or 250), 1, 2000)
+	local includeProperties = params.includeProperties == true
+	if params.servicesOnly == true then
+		root = game
+		depth = 1
+	end
+
+	local nodes = {}
+	local queue = { { instance = root, level = 0 } }
+	local index = 1
+	local truncated = false
+
+	while queue[index] do
+		local item = queue[index]
+		index += 1
+
+		if item.level &gt; 0 then
+			table.insert(nodes, Ops.describe(item.instance, item.level, includeProperties))
+			if #nodes &gt;= maxNodes then
+				truncated = true
+				break
+			end
+		end
+
+		if item.level &lt; depth then
+			for _, child in ipairs(item.instance:GetChildren()) do
+				if #nodes + (#queue - index + 1) &gt;= maxNodes then
+					truncated = true
+					break
+				end
+				table.insert(queue, { instance = child, level = item.level + 1 })
+			end
+		end
+	end
+
+	if queue[index] then
+		truncated = true
+	end
+
+	return {
+		root = Ops.describe(root, 0, false),
+		nodes = nodes,
+		truncated = truncated,
+		depth = depth,
+		maxNodes = maxNodes,
+	}
+end
+
+function Ops.searchInstances(params)
+	local root = Paths.resolve(params.under or &quot;game&quot;)
+	local query = string.lower(tostring(params.query or &quot;&quot;))
+	local className = tostring(params.className or &quot;&quot;)
+	local limit = clamp(math.floor(tonumber(params.limit) or 50), 1, 500)
+
+	local matches = {}
+	local visited = 0
+	local maxVisited = 25000
+
+	local function matchesClass(name: string): boolean
+		if className == &quot;&quot; then
+			return true
+		end
+		if string.sub(className, 1, 1) == &quot;*&quot; then
+			return string.sub(name, -#className + 1) == string.sub(className, 2)
+		end
+		return name == className
+	end
+
+	local function visit(instance: Instance)
+		if #matches &gt;= limit or visited &gt;= maxVisited then
+			return
+		end
+		visited += 1
+
+		if instance ~= root then
+			local nameMatches = query == &quot;&quot; or string.find(string.lower(instance.Name), query, 1, true) ~= nil
+			if nameMatches and matchesClass(instance.ClassName) then
+				table.insert(matches, {
+					path = Paths.of(instance),
+					name = instance.Name,
+					className = instance.ClassName,
+				})
+			end
+		end
+
+		for _, child in ipairs(instance:GetChildren()) do
+			if #matches &gt;= limit or visited &gt;= maxVisited then
+				return
+			end
+			visit(child)
+		end
+	end
+
+	visit(root)
+
+	return {
+		under = Paths.of(root),
+		query = query,
+		className = className,
+		count = #matches,
+		visited = visited,
+		truncated = #matches &gt;= limit or visited &gt;= maxVisited,
+		matches = matches,
+	}
+end
+
+function Ops.getInstance(params)
+	local instance = Paths.resolve(params.path)
+	local names = params.properties
+	if type(names) ~= &quot;table&quot; or #names == 0 then
+		names = Ops.defaultProperties(instance)
+	end
+
+	local properties = {}
+	local unreadable = {}
+	for _, name in ipairs(names) do
+		local ok, value = pcall(function()
+			return (instance :: any)[name]
+		end)
+		if ok then
+			properties[name] = Codec.encode(value)
+		else
+			table.insert(unreadable, name)
+		end
+	end
+
+	local tags = nil
+	local okTags, instanceTags = pcall(function()
+		return instance:GetTags()
+	end)
+	if okTags then
+		tags = instanceTags
+	end
+
+	return {
+		path = Paths.of(instance),
+		name = instance.Name,
+		className = instance.ClassName,
+		parent = instance.Parent and Paths.of(instance.Parent) or nil,
+		attributes = Codec.encode(instance:GetAttributes()),
+		properties = properties,
+		unreadable = unreadable,
+		tags = tags,
+	}
+end
+
+function Ops.createInstance(params)
+	local className = tostring(params.className or &quot;&quot;)
+	if className == &quot;&quot; then
+		fail(&quot;invalid_argument&quot;, &quot;className is required&quot;)
+	end
+
+	local ok, instance = pcall(Instance.new, className)
+	if not ok or not instance then
+		fail(&quot;invalid_class&quot;, (&quot;Instance.new(%q) failed: %s&quot;):format(className, tostring(instance)))
+	end
+
+	local parent = workspace
+	if params.parent ~= nil then
+		parent = Paths.resolve(params.parent)
+	end
+
+	if params.name ~= nil and params.name ~= &quot;&quot; then
+		instance.Name = tostring(params.name)
+	end
+
+	local applied, errors = Ops.applyProperties(instance, params.properties or {}, params.attributes or {})
+	instance.Parent = parent
+
+	return {
+		path = Paths.of(instance),
+		name = instance.Name,
+		className = instance.ClassName,
+		parent = Paths.of(parent),
+		applied = applied,
+		errors = errors,
+	}
+end
+
+function Ops.setProperties(params)
+	local instance = Paths.resolve(params.path)
+	local applied, errors = Ops.applyProperties(instance, params.properties or {}, params.attributes or {})
+	return {
+		path = Paths.of(instance),
+		applied = applied,
+		errors = errors,
+	}
+end
+
+function Ops.deleteInstance(params)
+	local instance = Paths.resolve(params.path)
+	if instance == game then
+		fail(&quot;invalid_path&quot;, &quot;refusing to destroy the DataModel&quot;)
+	end
+	local path = Paths.of(instance)
+	local className = instance.ClassName
+	instance:Destroy()
+	return { deleted = path, className = className }
+end
+
+function Ops.cloneInstance(params)
+	local instance = Paths.resolve(params.path)
+	local wasArchivable = instance.Archivable
+	instance.Archivable = true
+	local clone = instance:Clone()
+	instance.Archivable = wasArchivable
+
+	if not clone then
+		fail(&quot;clone_failed&quot;, (&quot;Clone() returned nil for %s&quot;):format(Paths.of(instance)))
+	end
+
+	if params.name ~= nil and params.name ~= &quot;&quot; then
+		clone.Name = tostring(params.name)
+	end
+
+	local parent = instance.Parent or workspace
+	if params.parent ~= nil then
+		parent = Paths.resolve(params.parent)
+	end
+	clone.Parent = parent
+
+	return { path = Paths.of(clone), name = clone.Name, className = clone.ClassName }
+end
+
+function Ops.reparentInstance(params)
+	local instance = Paths.resolve(params.path)
+	local parent = Paths.resolve(params.parent)
+
+	if instance == game then
+		fail(&quot;invalid_path&quot;, &quot;refusing to move the DataModel&quot;)
+	end
+	if parent == instance or Paths.isDescendantOf(parent, instance) then
+		fail(&quot;invalid_parent&quot;, &quot;cannot move an instance into itself or one of its descendants&quot;)
+	end
+
+	instance.Parent = parent
+	if params.name ~= nil and params.name ~= &quot;&quot; then
+		instance.Name = tostring(params.name)
+	end
+
+	return { path = Paths.of(instance), name = instance.Name, parent = Paths.of(parent) }
+end
+
+function Ops.getScriptSource(params)
+	local instance = Paths.resolve(params.path)
+	local source = readSource(instance)
+	return {
+		path = Paths.of(instance),
+		className = instance.ClassName,
+		lineCount = countLines(source),
+		source = source,
+	}
+end
+
+function Ops.setScriptSource(params)
+	local instance = Paths.resolve(params.path)
+	local source = params.source
+	if type(source) ~= &quot;string&quot; then
+		fail(&quot;invalid_argument&quot;, &quot;source must be a string&quot;)
+	end
+	readSource(instance)
+	writeSource(instance, source)
+	return {
+		path = Paths.of(instance),
+		lineCount = countLines(source),
+		length = #source,
+	}
+end
+
+function Ops.editScript(params)
+	local instance = Paths.resolve(params.path)
+	local find = params.find
+	local replace = params.replace
+	if type(find) ~= &quot;string&quot; or find == &quot;&quot; then
+		fail(&quot;invalid_argument&quot;, &quot;find must be a non-empty string&quot;)
+	end
+	if type(replace) ~= &quot;string&quot; then
+		fail(&quot;invalid_argument&quot;, &quot;replace must be a string&quot;)
+	end
+
+	local source = readSource(instance)
+	local path = Paths.of(instance)
+
+	local positions = {}
+	local cursor = 1
+	while true do
+		local first, last = string.find(source, find, cursor, true)
+		if not first then
+			break
+		end
+		table.insert(positions, { first, last })
+		cursor = last + 1
+	end
+
+	if #positions == 0 then
+		fail(&quot;not_found&quot;, (&quot;%q was not found in %s&quot;):format(find, path))
+	end
+
+	local newSource
+	local replaced
+	if params.all == true then
+		local pieces = {}
+		local previous = 1
+		for _, position in ipairs(positions) do
+			table.insert(pieces, string.sub(source, previous, position[1] - 1))
+			table.insert(pieces, replace)
+			previous = position[2] + 1
+		end
+		table.insert(pieces, string.sub(source, previous))
+		newSource = table.concat(pieces)
+		replaced = #positions
+	else
+		local occurrence = params.occurrence and math.floor(tonumber(params.occurrence) or 1) or nil
+		if not occurrence and #positions &gt; 1 then
+			fail(
+				&quot;ambiguous_match&quot;,
+				(&quot;%q appears %d times in %s; pass occurrence = N (1-based) or all = true&quot;):format(find, #positions, path)
+			)
+		end
+		local index = occurrence or 1
+		local position = positions[index]
+		if not position then
+			fail(&quot;occurrence_out_of_range&quot;, (&quot;%q appears %d times, cannot replace occurrence %d&quot;):format(find, #positions, index))
+		end
+		newSource = string.sub(source, 1, position[1] - 1) .. replace .. string.sub(source, position[2] + 1)
+		replaced = 1
+	end
+
+	writeSource(instance, newSource)
+	return { path = path, replaced = replaced, lineCount = countLines(newSource) }
+end
+
+function Ops.getSelection()
+	local selected = Selection:Get()
+	local list = {}
+	for _, instance in ipairs(selected) do
+		table.insert(list, { path = Paths.of(instance), name = instance.Name, className = instance.ClassName })
+	end
+	return { count = #list, selection = list }
+end
+
+local function focusCamera(instances: { Instance })
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return
+	end
+
+	local minimum = Vector3.new(math.huge, math.huge, math.huge)
+	local maximum = Vector3.new(-math.huge, -math.huge, -math.huge)
+	local found = false
+
+	for _, instance in ipairs(instances) do
+		local center: Vector3? = nil
+		local size: Vector3? = nil
+
+		if instance:IsA(&quot;BasePart&quot;) then
+			center = instance.Position
+			size = instance.Size
+		elseif instance:IsA(&quot;Model&quot;) then
+			local ok, boxCFrame, boxSize = pcall(function()
+				return instance:GetBoundingBox()
+			end)
+			if ok then
+				center = boxCFrame.Position
+				size = boxSize
+			end
+		end
+
+		if center and size then
+			found = true
+			local half = size / 2
+			minimum = Vector3.new(
+				math.min(minimum.X, center.X - half.X),
+				math.min(minimum.Y, center.Y - half.Y),
+				math.min(minimum.Z, center.Z - half.Z)
+			)
+			maximum = Vector3.new(
+				math.max(maximum.X, center.X + half.X),
+				math.max(maximum.Y, center.Y + half.Y),
+				math.max(maximum.Z, center.Z + half.Z)
+			)
+		end
+	end
+
+	if not found then
+		return
+	end
+
+	local center = (minimum + maximum) / 2
+	local radius = math.max((maximum - minimum).Magnitude / 2, 4)
+	camera.CFrame = CFrame.lookAt(center + Vector3.new(0, radius * 0.8, -radius * 2.2), center)
+end
+
+function Ops.setSelection(params)
+	local instances = {}
+	for _, path in ipairs(params.paths or {}) do
+		table.insert(instances, Paths.resolve(tostring(path)))
+	end
+	Selection:Set(instances)
+	if params.focus == true and #instances &gt; 0 then
+		pcall(focusCamera, instances)
+	end
+	return { count = #instances, selected = Ops.getSelection().selection }
+end
+
+function Ops.insertAsset(params)
+	local assetId = math.floor(tonumber(params.assetId) or 0)
+	if assetId &lt;= 0 then
+		fail(&quot;invalid_argument&quot;, &quot;assetId must be a positive integer&quot;)
+	end
+
+	local ok, model = pcall(function()
+		return InsertService:LoadAsset(assetId)
+	end)
+	if not ok then
+		fail(&quot;insert_failed&quot;, (&quot;InsertService:LoadAsset(%d) failed: %s&quot;):format(assetId, tostring(model)))
+	end
+
+	local parent = Paths.resolve(params.parent or &quot;Workspace&quot;)
+	local inserted = {}
+	for _, child in ipairs(model:GetChildren()) do
+		if params.name ~= nil and params.name ~= &quot;&quot; then
+			child.Name = tostring(params.name)
+		end
+		child.Parent = parent
+		table.insert(inserted, { path = Paths.of(child), name = child.Name, className = child.ClassName })
+	end
+	model:Destroy()
+
+	return { assetId = assetId, parent = Paths.of(parent), inserted = inserted }
+end
+
+function Ops.history(params)
+	local action = tostring(params.action or &quot;&quot;)
+	if action == &quot;undo&quot; then
+		local ok, message = pcall(function()
+			return ChangeHistoryService:Undo()
+		end)
+		if not ok then
+			fail(&quot;undo_failed&quot;, tostring(message))
+		end
+		return { action = action, waypoint = message }
+	elseif action == &quot;redo&quot; then
+		local ok, message = pcall(function()
+			return ChangeHistoryService:Redo()
+		end)
+		if not ok then
+			fail(&quot;redo_failed&quot;, tostring(message))
+		end
+		return { action = action, waypoint = message }
+	elseif action == &quot;waypoint&quot; then
+		local ok, message = pcall(function()
+			return ChangeHistoryService:SetWaypoint(&quot;RobloxMCP waypoint&quot;)
+		end)
+		if not ok then
+			fail(&quot;waypoint_failed&quot;, tostring(message))
+		end
+		return { action = action }
+	end
+	fail(&quot;invalid_argument&quot;, &quot;action must be undo, redo or waypoint&quot;)
+end
+
+function Ops.getLogs(params)
+	local limit = clamp(math.floor(tonumber(params.limit) or 50), 1, 500)
+	local filter = tostring(params.messageType or &quot;all&quot;)
+
+	local selected = {}
+	for _, entry in ipairs(Ops.logs) do
+		if filter == &quot;all&quot; or entry.type == filter then
+			table.insert(selected, entry)
+			if #selected &gt;= limit then
+				break
+			end
+		end
+	end
+
+	local ordered = {}
+	for index = #selected, 1, -1 do
+		table.insert(ordered, selected[index])
+	end
+
+	return { lines = ordered, total = #Ops.logs, filter = filter }
+end
+
+function Ops.selftest()
+	local checks = {}
+
+	local function check(name: string, callback: () -&gt; any)
+		local ok, value = pcall(callback)
+		table.insert(checks, {
+			name = name,
+			ok = ok,
+			detail = ok and tostring(value) or tostring(value),
+		})
+	end
+
+	check(&quot;instance_new&quot;, function()
+		return Instance.new(&quot;Part&quot;).ClassName
+	end)
+
+	check(&quot;source_read_write&quot;, function()
+		local probe = Instance.new(&quot;Script&quot;)
+		probe.Source = &quot;print('probe')&quot;
+		local source = probe.Source
+		probe:Destroy()
+		return source == &quot;print('probe')&quot; and &quot;ok&quot; or &quot;Source did not round-trip&quot;
+	end)
+
+	check(&quot;change_history_recording&quot;, function()
+		local recording = ChangeHistoryService:TryBeginRecording(&quot;RobloxMCP selftest&quot;)
+		if not recording then
+			return &quot;another recording is in progress&quot;
+		end
+		ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Cancel)
+		return &quot;ok&quot;
+	end)
+
+	check(&quot;insert_service&quot;, function()
+		return type(InsertService.LoadAsset) == &quot;function&quot; and &quot;available&quot; or &quot;missing&quot;
+	end)
+
+	check(&quot;script_editor_service&quot;, function()
+		return scriptEditorService and &quot;available&quot; or &quot;missing (falls back to direct Source writes)&quot;
+	end)
+
+	check(&quot;log_capture&quot;, function()
+		return #Ops.logs &gt;= 0 and &quot;listening&quot; or &quot;not listening&quot;
+	end)
+
+	check(&quot;http&quot;, function()
+		return HttpService.HttpEnabled and &quot;HttpEnabled = true&quot; or &quot;HttpEnabled = false (plugin requests usually still work)&quot;
+	end)
+
+	local studioVersion = &quot;&quot;
+	pcall(function()
+		studioVersion = version()
+	end)
+
+	return {
+		pluginVersion = Ops.PLUGIN_VERSION,
+		studioVersion = studioVersion,
+		place = game.Name,
+		checks = checks,
+	}
+end
+
+function Ops.startLogCapture(onLog: ((any) -&gt; ())?)
+	Ops.onLog = onLog
+	pcall(function()
+		LogService.MessageOut:Connect(function(message: string, messageType: EnumItem)
+			local entry = {
+				at = os.date(&quot;!%Y-%m-%dT%H:%M:%SZ&quot;),
+				type = levelOf(messageType),
+				text = message,
+			}
+			table.insert(Ops.logs, 1, entry)
+			if #Ops.logs &gt; Ops.MAX_LOGS then
+				table.remove(Ops.logs)
+			end
+			if Ops.onLog then
+				Ops.onLog(entry)
+			end
+		end)
+	end)
+
+	pcall(function()
+		for _, entry in ipairs(LogService:GetLogHistory()) do
+			local message = entry.message
+			table.insert(Ops.logs, 1, {
+				at = &quot;&quot;,
+				type = levelOf(entry.messageType),
+				text = message,
+			})
+		end
+		if #Ops.logs &gt; Ops.MAX_LOGS then
+			local trimmed = {}
+			for index = 1, Ops.MAX_LOGS do
+				trimmed[index] = Ops.logs[index]
+			end
+			Ops.logs = trimmed
+		end
+	end)
+
+	return true
+end
+
+return Ops
+</ProtectedString>
+    </Properties>
+  </Item>
+  <Item class="ModuleScript" referent="RBX4">
+    <Properties>
+      <string name="Name">Paths</string>
+      <ProtectedString name="Source">--!nonstrict
+-- Resolves and prints instance paths such as `Workspace.Model.Part`.
+-- Dot form is used for names matching [%w_]+, bracket form for everything else.
+
+local Paths = {}
+
+local function fail(message: string)
+	error({ code = &quot;invalid_path&quot;, message = message }, 0)
+end
+
+local function tokenize(input: string): { string }
+	local segments = {}
+	local index = 1
+	local length = #input
+
+	while index &lt;= length do
+		local char = string.sub(input, index, index)
+
+		if char == &quot;.&quot; or char == &quot;/&quot; then
+			index += 1
+		elseif char == &quot;[&quot; then
+			local quote = string.sub(input, index + 1, index + 1)
+			if quote ~= '&quot;' and quote ~= &quot;'&quot; then
+				fail((&quot;expected a quoted name after '[' at character %d of %q&quot;):format(index, input))
+			end
+			local closing = string.find(input, quote, index + 2, true)
+			if not closing then
+				fail((&quot;unterminated quote in path %q&quot;):format(input))
+			end
+			local name = string.sub(input, index + 2, closing - 1)
+			name = string.gsub(name, '\\&quot;', '&quot;')
+			table.insert(segments, name)
+			index = closing + 1
+			if string.sub(input, index, index) == &quot;]&quot; then
+				index += 1
+			end
+		else
+			local startIndex, endIndex = string.find(input, &quot;^[%w_]+&quot;, index)
+			if not startIndex then
+				fail((&quot;unexpected character %q at position %d of path %q&quot;):format(char, index, input))
+			end
+			table.insert(segments, string.sub(input, startIndex, endIndex))
+			index = endIndex + 1
+		end
+	end
+
+	return segments
+end
+
+function Paths.escapeName(name: string): string
+	if string.match(name, &quot;^[%w_]+$&quot;) then
+		return name
+	end
+	return '[&quot;' .. string.gsub(name, '&quot;', '\\&quot;') .. '&quot;]'
+end
+
+-- Human readable path for an instance, rooted at `game`.
+function Paths.of(instance: Instance): string
+	local parts = {}
+	local current: Instance? = instance
+
+	while current and current ~= game do
+		table.insert(parts, 1, Paths.escapeName(current.Name))
+		current = current.Parent
+	end
+
+	if #parts == 0 then
+		return &quot;game&quot;
+	end
+
+	return &quot;game.&quot; .. table.concat(parts, &quot;.&quot;)
+end
+
+function Paths.resolve(path: string?): Instance
+	if path == nil or path == &quot;&quot; or path == &quot;game&quot; or path == &quot;.&quot; then
+		return game
+	end
+
+	local segments = tokenize(path)
+	local current: Instance = game
+
+	for _, segment in ipairs(segments) do
+		if segment == &quot;game&quot; and current == game then
+			continue
+		end
+
+		local child: Instance?
+		if current == game then
+			child = game:FindFirstChild(segment)
+			if not child then
+				local ok, service = pcall(function()
+					return game:GetService(segment)
+				end)
+				if ok then
+					child = service
+				end
+			end
+		else
+			child = current:FindFirstChild(segment)
+		end
+
+		if not child then
+			fail((&quot;no instance named %q under %s&quot;):format(segment, current:GetFullName()))
+		end
+
+		current = child
+	end
+
+	return current
+end
+
+function Paths.isDescendantOf(instance: Instance, possibleAncestor: Instance): boolean
+	local current = instance.Parent
+	while current do
+		if current == possibleAncestor then
+			return true
+		end
+		current = current.Parent
+	end
+	return false
+end
+
+return Paths
+</ProtectedString>
+    </Properties>
+  </Item>
+  </Item>
+</roblox>
